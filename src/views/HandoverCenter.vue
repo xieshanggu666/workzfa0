@@ -191,8 +191,11 @@ function itemResultText(item) {
   parts.push('所有权已转移')
   if (r.reviewIds?.length) parts.push('评审待办 ' + r.reviewIds.length + ' 项已改挂')
   if (r.freshTicketId) parts.push('保鲜复核单已留痕')
+  if (r.correctionTicketIds?.length) parts.push('纠错待办 ' + r.correctionTicketIds.length + ' 项已改挂')
+  if (r.gapTicketIds?.length) parts.push('缺口工单 ' + r.gapTicketIds.length + ' 项已改挂')
   if (r.accessPending) parts.push('待审批访问申请 ' + r.accessPending + ' 项随负责人转移')
   if (r.revokedGrants) parts.push('收回原负责人授权 ' + r.revokedGrants + ' 项')
+  if (r.cancelledApplications) parts.push('取消原负责人待审批申请 ' + r.cancelledApplications + ' 项')
   return parts.join(' · ')
 }
 
@@ -211,7 +214,7 @@ onMounted(async () => {
       <h2>🤝 责任交接</h2>
       <p class="sub">
         负责人勾选名下文档批量发起交接，同一批中可逐篇指定不同接任者；各接任者独立确认或谢绝，
-        管理员按确认结果分批批准——已确认篇先批先转，文档所有权、待办审批与保鲜责任随批准一并转移；
+        管理员按确认结果分批批准——已确认篇先批先转，文档所有权、评审/纠错/缺口待办与保鲜责任随批准一并转移；
         交接期间校验并发变更，不一致的篇目失败回退，历史归属全程保留，原负责人权限按交接决定保留或收回。
       </p>
       <div class="head-row">

@@ -2,7 +2,8 @@
 // 覆盖：v10 迁移（旧整单接任者 → 逐篇接任者/状态）→ 负责人在同一批中逐篇指定接任者
 // （权限/快照/重复发起校验）→ 各接任者按篇独立确认/谢绝 → 管理员按确认结果分批批准
 // （先确认先批、未确认不批）→ 批准篇统一转移（所有权 + 历史归属 + 评审待办 + 保鲜责任 +
-// 待审批访问申请 + 按决定收回权限）→ 交接期间并发变更：冲突篇失败回退、同批一致篇正常转移；
+// 纠错/缺口待办 + 待审批访问申请 + 按决定收回权限——revoke 含有效授权撤销与待审批申请取消）→
+// 交接期间并发变更：冲突篇失败回退、同批一致篇正常转移；
 // 驳回 / 取消 / 多次交接历史累积 / 批次状态派生纯函数。
 // 运行：npm run test:handover
 import 'fake-indexeddb/auto'
@@ -22,6 +23,8 @@ import {
 } from '@/utils/handover'
 import { canDecideAccess, ACCESS, isGrantActive } from '@/utils/access'
 import { PUBLISH } from '@/utils/review'
+import { CORRECTION } from '@/utils/correction'
+import { GAP } from '@/utils/gap'
 
 let passed = 0
 let failed = 0
@@ -205,7 +208,8 @@ const revA = {
 }
 await db.reviews.add(revA)
 await db.docs.update(docA2.id, { publishState: PUBLISH.IN_REVIEW, activeReviewId: revA.id })
-// docB2：保鲜复核单流转中 + 待审批访问申请 + 原负责人的历史有效授权 → 接任者 third
+// docB2：保鲜复核单流转中 + 待审批访问申请 + 原负责人的历史有效授权 + 原负责人的待审批申请
+//        + 原负责人认领的纠错单 + 原负责人处理中且关联本文档的缺口工单 → 接任者 third
 const docB2 = await mkDoc({ editors: [owner.id, third.id] })
 const frB = {
   id: uid('fr'), docId: docB2.id, round: 1, status: 'open', cycleDays: 30, dueAt: nowIso(),
@@ -225,7 +229,36 @@ const accGrant = {
   grant: { permission: 'collab', grantedAt: nowIso(), expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(), revokedAt: null },
   timeline: []
 }
-await db.accessRequests.bulkAdd([accPending, accGrant])
+// 原负责人自己在本文档上的待审批申请：revoke 模式下应一并取消，避免新负责人误批准使其重回权限
+const accOwnPending = {
+  id: uid('acc'), docId: docB2.id, applicantId: owner.id, status: ACCESS.PENDING, requestedPermission: 'read',
+  reason: '交接前提交的申请', createdAt: nowIso(), decidedBy: null, decidedAt: null, decisionNote: '', grant: null, timeline: []
+}
+await db.accessRequests.bulkAdd([accPending, accGrant, accOwnPending])
+// 原负责人在本文档上认领中的纠错单 → 应改挂接任者；他人认领的纠错单不受影响
+const corrB = {
+  id: uid('cor'), docId: docB2.id, type: 'factual', description: '数据口径错误', expected: '', source: 'doc',
+  status: CORRECTION.CLAIMED, createdBy: viewer.id, createdAt: nowIso(), claimedBy: owner.id, claimedAt: nowIso(),
+  reviewId: null, resolvedVersion: null, resolvedAt: null, withdrawnBy: null, withdrawnAt: null, timeline: []
+}
+const corrOther = {
+  id: uid('cor'), docId: docB2.id, type: 'typo', description: '错别字', expected: '', source: 'doc',
+  status: CORRECTION.CLAIMED, createdBy: viewer.id, createdAt: nowIso(), claimedBy: next.id, claimedAt: nowIso(),
+  reviewId: null, resolvedVersion: null, resolvedAt: null, withdrawnBy: null, withdrawnAt: null, timeline: []
+}
+await db.correctionTickets.bulkAdd([corrB, corrOther])
+// 原负责人处理中且已关联本文档的缺口工单 → 应改挂接任者；未关联本文档的个人工单不随交接转移
+const gapB = {
+  id: uid('gap'), question: '如何配置备份策略？', detail: '', status: GAP.CLAIMED,
+  createdBy: viewer.id, createdAt: nowIso(), claimedBy: owner.id, claimedAt: nowIso(),
+  docId: docB2.id, reviewId: null, groupId: null, resolvedAt: null, timeline: []
+}
+const gapUnlinked = {
+  id: uid('gap'), question: '如何申请新账号？', detail: '', status: GAP.CLAIMED,
+  createdBy: viewer.id, createdAt: nowIso(), claimedBy: owner.id, claimedAt: nowIso(),
+  docId: null, reviewId: null, groupId: null, resolvedAt: null, timeline: []
+}
+await db.gapTickets.bulkAdd([gapB, gapUnlinked])
 await Promise.all([kb.reloadDocs(), review.reload(), access.reload(), freshness.reload()])
 
 r = await handover.initiateHandover({ items: [{ docId: docA2.id, toUserId: next.id }, { docId: docB2.id, toUserId: third.id }], revokeMode: REVOKE_MODE.REVOKE, note: '整体交接' }, owner)
@@ -260,19 +293,47 @@ assert(accP1.status === ACCESS.PENDING, '待审批访问申请保留（审批责
 assert(canDecideAccess(accP1, docB21, third.id, third.role) === true, '接任者作为新负责人可审批该申请')
 const accG1 = await db.accessRequests.get(accGrant.id)
 assert(accG1.status === ACCESS.REVOKED && !isGrantActive(accG1), '原负责人的有效授权按交接决定收回')
+const accOwn1 = await db.accessRequests.get(accOwnPending.id)
+assert(accOwn1.status === ACCESS.CANCELLED && accOwn1.timeline.some((t) => t.action === 'cancel'), 'revoke 模式：原负责人的待审批申请一并取消并留痕（不遗留重回权限的通道）')
+const corrB1 = await db.correctionTickets.get(corrB.id)
+assert(corrB1.claimedBy === third.id && corrB1.timeline.some((t) => t.action === 'handover'), '原负责人认领的纠错单改挂接任者并留痕')
+assert((await db.correctionTickets.get(corrOther.id)).claimedBy === next.id, '他人认领的纠错单不受交接影响')
+const gapB1 = await db.gapTickets.get(gapB.id)
+assert(gapB1.claimedBy === third.id && gapB1.timeline.some((t) => t.action === 'handover'), '关联本文档的缺口工单改挂接任者并留痕')
+assert((await db.gapTickets.get(gapUnlinked.id)).claimedBy === owner.id, '未关联本文档的缺口工单不随交接转移')
 assert(itemOf(ho2Done, docB2.id).result.accessPending === 1 && itemOf(ho2Done, docB2.id).result.revokedGrants === 1, '转移结果逐篇留档（待审批 1 项、收回授权 1 项）')
+assert(itemOf(ho2Done, docB2.id).result.cancelledApplications === 1, '转移结果记录取消的待审批申请')
+assert(itemOf(ho2Done, docB2.id).result.correctionTicketIds.includes(corrB.id), '转移结果记录改挂的纠错单')
+assert(itemOf(ho2Done, docB2.id).result.gapTicketIds.includes(gapB.id), '转移结果记录改挂的缺口工单')
 assert(itemOf(ho2Done, docA2.id).result.reviewIds.includes(revA.id), '转移结果记录改挂的评审单')
 assert(ho2Done.timeline.filter((t) => t.action === 'approve').length === 2, '每篇批准均留痕')
 
 // ---------- 5. keep 模式：保留原负责人协作权限 ----------
 console.log('\n[5] keep 模式保留原负责人协作权限')
 const docC = await mkDoc()
+// keep 模式：待办（纠错单）随责任转移，但原负责人的权限类记录（待审批申请）不动
+const corrC = {
+  id: uid('cor'), docId: docC.id, type: 'outdated', description: '内容过时', expected: '', source: 'doc',
+  status: CORRECTION.CLAIMED, createdBy: viewer.id, createdAt: nowIso(), claimedBy: owner.id, claimedAt: nowIso(),
+  reviewId: null, resolvedVersion: null, resolvedAt: null, withdrawnBy: null, withdrawnAt: null, timeline: []
+}
+await db.correctionTickets.add(corrC)
+const accKeepPending = {
+  id: uid('acc'), docId: docC.id, applicantId: owner.id, status: ACCESS.PENDING, requestedPermission: 'read',
+  reason: 'keep 模式不取消', createdAt: nowIso(), decidedBy: null, decidedAt: null, decisionNote: '', grant: null, timeline: []
+}
+await db.accessRequests.add(accKeepPending)
 r = await handover.initiateHandover({ items: [{ docId: docC.id, toUserId: next.id }], revokeMode: REVOKE_MODE.KEEP, note: '' }, owner)
 await handover.confirmHandover(r.handover.id, [docC.id], next)
 r = await handover.decideHandover(r.handover.id, [docC.id], 'approve', '', admin)
 assert(r.status === 'ok', 'keep 模式交接完成')
 const docC1 = await getDoc(docC.id)
 assert(docC1.ownerId === next.id && docC1.editors.includes(owner.id), '所有权转移但原负责人保留协作成员身份')
+const corrC1 = await db.correctionTickets.get(corrC.id)
+assert(corrC1.claimedBy === next.id && corrC1.timeline.some((t) => t.action === 'handover'), 'keep 模式：纠错待办仍随责任改挂接任者')
+const accKeep1 = await db.accessRequests.get(accKeepPending.id)
+assert(accKeep1.status === ACCESS.PENDING, 'keep 模式：原负责人的待审批申请保留（不收回权限）')
+assert(itemOf(await getHo(r.handover.id), docC.id).result.cancelledApplications === 0, 'keep 模式：无申请被取消')
 
 // ---------- 6. 并发变更：冲突篇失败回退，同批一致篇正常转移 ----------
 console.log('\n[6] 交接期间并发变更 → 逐篇回退、篇间独立')
