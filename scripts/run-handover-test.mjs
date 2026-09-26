@@ -2,7 +2,8 @@
 // 覆盖：v10 迁移（旧整单接任者 → 逐篇接任者/状态）→ 负责人在同一批中逐篇指定接任者
 // （权限/快照/重复发起校验）→ 各接任者按篇独立确认/谢绝 → 管理员按确认结果分批批准
 // （先确认先批、未确认不批）→ 批准篇统一转移（所有权 + 历史归属 + 评审待办 + 保鲜责任 +
-// 待审批访问申请 + 按决定收回权限）→ 交接期间并发变更：冲突篇失败回退、同批一致篇正常转移；
+// 待审批访问申请 + 原负责人名下流转工单改挂 + 按决定收回权限并取消其待审批申请）→
+// 交接期间并发变更（含保鲜配置来源转换）：冲突篇失败回退、同批一致篇正常转移；
 // 驳回 / 取消 / 多次交接历史累积 / 批次状态派生纯函数。
 // 运行：npm run test:handover
 import 'fake-indexeddb/auto'
@@ -22,6 +23,8 @@ import {
 } from '@/utils/handover'
 import { canDecideAccess, ACCESS, isGrantActive } from '@/utils/access'
 import { PUBLISH } from '@/utils/review'
+import { GAP } from '@/utils/gap'
+import { CORRECTION } from '@/utils/correction'
 
 let passed = 0
 let failed = 0
@@ -196,7 +199,7 @@ assert(ho1Cur.status === HANDOVER.PARTIAL, '全部篇终态且结果不一 → �
 
 // ---------- 4. 批准执行：全要素统一转移（revoke 模式，逐篇接任者） ----------
 console.log('\n[4] 批准执行：所有权/待办审批/保鲜责任统一转移，按决定收回权限')
-// docA2：负责人名下有待审批的评审单（待办审批转移）→ 接任者 next
+// docA2：负责人名下有待审批的评审单（待办审批转移）+ 原负责人认领中的纠错工单 → 接任者 next
 const docA2 = await mkDoc()
 const revA = {
   id: uid('rev'), docId: docA2.id, status: 'pending', submittedBy: owner.id, submittedAt: nowIso(),
@@ -205,7 +208,20 @@ const revA = {
 }
 await db.reviews.add(revA)
 await db.docs.update(docA2.id, { publishState: PUBLISH.IN_REVIEW, activeReviewId: revA.id })
-// docB2：保鲜复核单流转中 + 待审批访问申请 + 原负责人的历史有效授权 → 接任者 third
+const corA = {
+  id: uid('cor'), docId: docA2.id, type: 'content', description: '数据口径过期', expected: '', source: 'doc',
+  status: CORRECTION.CLAIMED, createdBy: third.id, createdAt: nowIso(),
+  claimedBy: owner.id, claimedAt: nowIso(), reviewId: null, resolvedVersion: null, resolvedAt: null,
+  withdrawnBy: null, withdrawnAt: null, timeline: []
+}
+const corA3 = {
+  id: uid('cor'), docId: docA2.id, type: 'typo', description: '错别字', expected: '', source: 'doc',
+  status: CORRECTION.CLAIMED, createdBy: next.id, createdAt: nowIso(),
+  claimedBy: third.id, claimedAt: nowIso(), reviewId: null, resolvedVersion: null, resolvedAt: null,
+  withdrawnBy: null, withdrawnAt: null, timeline: []
+}
+await db.correctionTickets.bulkAdd([corA, corA3])
+// docB2：保鲜复核单流转中 + 待审批访问申请 + 原负责人的历史有效授权与待审批申请 → 接任者 third
 const docB2 = await mkDoc({ editors: [owner.id, third.id] })
 const frB = {
   id: uid('fr'), docId: docB2.id, round: 1, status: 'open', cycleDays: 30, dueAt: nowIso(),
@@ -225,7 +241,12 @@ const accGrant = {
   grant: { permission: 'collab', grantedAt: nowIso(), expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(), revokedAt: null },
   timeline: []
 }
-await db.accessRequests.bulkAdd([accPending, accGrant])
+// 原负责人在本文档上本人待审批的访问申请（如成为负责人前提交）：revoke 模式应一并取消，否则后续批准会让权限复活
+const accOwnPending = {
+  id: uid('acc'), docId: docB2.id, applicantId: owner.id, status: ACCESS.PENDING, requestedPermission: 'read',
+  reason: '成为负责人前提交的申请', createdAt: nowIso(), decidedBy: null, decidedAt: null, decisionNote: '', grant: null, timeline: []
+}
+await db.accessRequests.bulkAdd([accPending, accGrant, accOwnPending])
 await Promise.all([kb.reloadDocs(), review.reload(), access.reload(), freshness.reload()])
 
 r = await handover.initiateHandover({ items: [{ docId: docA2.id, toUserId: next.id }, { docId: docB2.id, toUserId: third.id }], revokeMode: REVOKE_MODE.REVOKE, note: '整体交接' }, owner)
@@ -251,6 +272,10 @@ assert(docA21.editors.includes(next.id) && !docA21.editors.includes(owner.id), '
 const revA1 = await db.reviews.get(revA.id)
 assert(revA1.submittedBy === next.id, 'docA2 待办评审改挂该篇接任者')
 assert(revA1.timeline.some((t) => t.action === 'handover'), '评审单留有交接转移痕迹')
+const corA1 = await db.correctionTickets.get(corA.id)
+assert(corA1.claimedBy === next.id && corA1.timeline.some((t) => t.action === 'handover'), 'docA2 原负责人认领中的纠错工单随责任改挂并留痕')
+assert((await db.correctionTickets.get(corA3.id)).claimedBy === third.id, 'docA2 其他成员认领的纠错工单不受影响')
+assert(itemOf(ho2Done, docA2.id).result.correctionTicketIds.includes(corA.id), '转移结果记录改挂的纠错工单')
 const docB21 = await getDoc(docB2.id)
 assert(docB21.ownerId === third.id && docB21.freshness.activeTicket === frB.id, 'docB2 所有权与保鲜责任一并转移')
 const frB1 = await db.freshnessTickets.get(frB.id)
@@ -260,7 +285,10 @@ assert(accP1.status === ACCESS.PENDING, '待审批访问申请保留（审批责
 assert(canDecideAccess(accP1, docB21, third.id, third.role) === true, '接任者作为新负责人可审批该申请')
 const accG1 = await db.accessRequests.get(accGrant.id)
 assert(accG1.status === ACCESS.REVOKED && !isGrantActive(accG1), '原负责人的有效授权按交接决定收回')
+const accOP1 = await db.accessRequests.get(accOwnPending.id)
+assert(accOP1.status === ACCESS.CANCELLED && accOP1.timeline.some((t) => t.action === 'cancel'), 'revoke 模式：原负责人本人待审批的申请一并取消（防止后续批准复活权限）')
 assert(itemOf(ho2Done, docB2.id).result.accessPending === 1 && itemOf(ho2Done, docB2.id).result.revokedGrants === 1, '转移结果逐篇留档（待审批 1 项、收回授权 1 项）')
+assert(itemOf(ho2Done, docB2.id).result.cancelledRequests === 1, '转移结果记录取消的本人待审批申请')
 assert(itemOf(ho2Done, docA2.id).result.reviewIds.includes(revA.id), '转移结果记录改挂的评审单')
 assert(ho2Done.timeline.filter((t) => t.action === 'approve').length === 2, '每篇批准均留痕')
 
@@ -350,8 +378,110 @@ assert(docC2.ownerId === third.id, '二次交接后所有权归第三成员')
 assert(docC2.ownerHistory.length === 2 && docC2.ownerHistory[0].ownerId === owner.id && docC2.ownerHistory[1].ownerId === next.id, '历任负责人全程保留（2 段任期）')
 assert(!docC2.editors.includes(next.id) && docC2.editors.includes(third.id), '二次交接按 revoke 决定收回上一任权限')
 
-// ---------- 9. 纯函数：并发校验与批次状态派生 ----------
-console.log('\n[9] 并发变更校验与批次状态派生纯函数')
+// ---------- 9. 跨模块一致性：评审关联工单随责任改挂 ----------
+console.log('\n[9] 评审关联的缺口/纠错工单随责任一并改挂，不留旧负责人待办')
+// docJ：负责人名下缺口送审评审中（工单 IN_REVIEW）+ 退回处理中的缺口工单 + 本人待审批申请 → revoke 给 next
+const docJ = await mkDoc()
+const revJ = {
+  id: uid('rev'), docId: docJ.id, status: 'pending', submittedBy: owner.id, submittedAt: nowIso(),
+  snapshot: { title: docJ.title, body: docJ.body, categoryId: 'c', tagIds: [], visibility: 'public' },
+  baseVersion: 1, decidedBy: null, decidedAt: null, decisionNote: '', timeline: []
+}
+await db.reviews.add(revJ)
+await db.docs.update(docJ.id, { publishState: PUBLISH.IN_REVIEW, activeReviewId: revJ.id })
+const gapJ = {
+  id: uid('gap'), question: '如何配置发布门禁？', detail: '', status: GAP.IN_REVIEW,
+  createdBy: viewer.id, createdAt: nowIso(), claimedBy: owner.id, claimedAt: nowIso(),
+  docId: docJ.id, reviewId: revJ.id, groupId: null, resolvedAt: null, timeline: []
+}
+const gapJ2 = {
+  id: uid('gap'), question: '门禁驳回后如何重发？', detail: '', status: GAP.CLAIMED,
+  createdBy: viewer.id, createdAt: nowIso(), claimedBy: owner.id, claimedAt: nowIso(),
+  docId: docJ.id, reviewId: null, groupId: null, resolvedAt: null, timeline: []
+}
+const gapJ3 = {
+  id: uid('gap'), question: '保鲜周期怎么算？', detail: '', status: GAP.CLAIMED,
+  createdBy: viewer.id, createdAt: nowIso(), claimedBy: third.id, claimedAt: nowIso(),
+  docId: docJ.id, reviewId: null, groupId: null, resolvedAt: null, timeline: []
+}
+await db.gapTickets.bulkAdd([gapJ, gapJ2, gapJ3])
+const accJ = {
+  id: uid('acc'), docId: docJ.id, applicantId: owner.id, status: ACCESS.PENDING, requestedPermission: 'read',
+  reason: '历史申请', createdAt: nowIso(), decidedBy: null, decidedAt: null, decisionNote: '', grant: null, timeline: []
+}
+await db.accessRequests.add(accJ)
+await Promise.all([kb.reloadDocs(), review.reload(), access.reload()])
+
+r = await handover.initiateHandover({ items: [{ docId: docJ.id, toUserId: next.id }], revokeMode: REVOKE_MODE.REVOKE, note: '' }, owner)
+assert(r.status === 'ok', '含缺口工单/待审批申请的文档发起交接成功')
+await handover.confirmHandover(r.handover.id, [docJ.id], next)
+r = await handover.decideHandover(r.handover.id, [docJ.id], 'approve', '', admin)
+assert(r.status === 'ok' && r.done === 1, 'docJ 批准转移完成')
+const revJ1 = await db.reviews.get(revJ.id)
+assert(revJ1.submittedBy === next.id, 'docJ 缺口送审评审改挂接任者')
+const gapJ1 = await db.gapTickets.get(gapJ.id)
+assert(gapJ1.claimedBy === next.id && gapJ1.status === GAP.IN_REVIEW && gapJ1.timeline.some((t) => t.action === 'handover'), '送审中的缺口工单随责任改挂并留痕（与评审单一致）')
+assert((await db.gapTickets.get(gapJ2.id)).claimedBy === next.id, '退回处理中的缺口工单（绑定本文档）一并改挂')
+assert((await db.gapTickets.get(gapJ3.id)).claimedBy === third.id, '其他成员认领的缺口工单不受影响')
+assert((await db.accessRequests.get(accJ.id)).status === ACCESS.CANCELLED, 'revoke 模式：原负责人本人待审批申请一并取消')
+const hoJDone = await getHo(r.handover.id)
+assert(itemOf(hoJDone, docJ.id).result.gapTicketIds.length === 2 && itemOf(hoJDone, docJ.id).result.cancelledRequests === 1, '转移结果记录改挂工单与取消申请')
+
+// docK：纠错修订送审中（评审 + 纠错单 IN_REVIEW）→ keep 给 third，工单与评审同源改挂
+const docK = await mkDoc()
+const corK = {
+  id: uid('cor'), docId: docK.id, type: 'content', description: '步骤缺失', expected: '', source: 'qa',
+  status: CORRECTION.IN_REVIEW, createdBy: viewer.id, createdAt: nowIso(),
+  claimedBy: owner.id, claimedAt: nowIso(), reviewId: null, resolvedVersion: null, resolvedAt: null,
+  withdrawnBy: null, withdrawnAt: null, timeline: []
+}
+const revK = {
+  id: uid('rev'), docId: docK.id, status: 'pending', submittedBy: owner.id, submittedAt: nowIso(),
+  snapshot: { title: docK.title, body: docK.body, categoryId: 'c', tagIds: [], visibility: 'public' },
+  baseVersion: 1, correctionTicketId: corK.id, decidedBy: null, decidedAt: null, decisionNote: '', timeline: []
+}
+corK.reviewId = revK.id
+await db.correctionTickets.add(corK)
+await db.reviews.add(revK)
+await db.docs.update(docK.id, { publishState: PUBLISH.IN_REVIEW, activeReviewId: revK.id })
+const accK = {
+  id: uid('acc'), docId: docK.id, applicantId: owner.id, status: ACCESS.PENDING, requestedPermission: 'read',
+  reason: '历史申请', createdAt: nowIso(), decidedBy: null, decidedAt: null, decisionNote: '', grant: null, timeline: []
+}
+await db.accessRequests.add(accK)
+await Promise.all([kb.reloadDocs(), review.reload(), access.reload()])
+
+r = await handover.initiateHandover({ items: [{ docId: docK.id, toUserId: third.id }], revokeMode: REVOKE_MODE.KEEP, note: '' }, owner)
+await handover.confirmHandover(r.handover.id, [docK.id], third)
+r = await handover.decideHandover(r.handover.id, [docK.id], 'approve', '', admin)
+assert(r.status === 'ok' && r.done === 1, 'docK 批准转移完成（keep 模式）')
+assert((await db.reviews.get(revK.id)).submittedBy === third.id, 'docK 纠错修订评审改挂接任者')
+const corK1 = await db.correctionTickets.get(corK.id)
+assert(corK1.claimedBy === third.id && corK1.status === CORRECTION.IN_REVIEW && corK1.timeline.some((t) => t.action === 'handover'), '送审中的纠错单随责任改挂（与评审单一致）')
+assert((await db.accessRequests.get(accK.id)).status === ACCESS.PENDING, 'keep 模式：原负责人的待审批申请保留，由新负责人接续审批')
+assert(itemOf(await getHo(r.handover.id), docK.id).result.correctionTicketIds.includes(corK.id), '转移结果记录改挂的纠错单')
+
+// ---------- 10. 并发变更：保鲜配置来源转换 → 冲突回退 ----------
+console.log('\n[10] 交接期间保鲜配置来源转换（策略关闭）→ 该篇回退')
+const docL = await mkDoc({
+  freshness: {
+    cycleDays: 30, nextDueAt: new Date(Date.now() + 86400000).toISOString(), round: 1,
+    activeTicket: null, source: 'policy', policyId: 'fp-x'
+  }
+})
+r = await handover.initiateHandover({ items: [{ docId: docL.id, toUserId: next.id }], revokeMode: 'keep', note: '' }, owner)
+const hoL = r.handover
+assert(itemOf(hoL, docL.id).snapshot.freshnessSource === 'policy' && itemOf(hoL, docL.id).snapshot.freshnessPolicyId === 'fp-x', '发起快照记录保鲜配置来源')
+await handover.confirmHandover(hoL.id, [docL.id], next)
+// 交接流转期间，管理员关闭分类策略：在途/继承配置转为文档级（周期签名不变，仅来源变化）
+await db.docs.update(docL.id, { 'freshness.source': 'doc', 'freshness.policyId': null })
+r = await handover.decideHandover(hoL.id, [docL.id], 'approve', '', admin)
+assert(r.status === 'ok' && r.done === 0 && r.failures[0].fields.includes('保鲜配置已变化'), '配置来源转换被识别为并发变更，该篇回退')
+assert((await getDoc(docL.id)).ownerId === owner.id, 'docL 所有权未转移')
+assert(itemOf(await getHo(hoL.id), docL.id).status === HO_ITEM.FAILED, 'docL 篇标记失败回退')
+
+// ---------- 11. 纯函数：并发校验与批次状态派生 ----------
+console.log('\n[11] 并发变更校验与批次状态派生纯函数')
 const snapItems = [
   { docId: 'x1', title: 'X1', snapshot: { ownerId: 'a', updatedAt: 't1', activeReviewId: null, freshnessSig: '-' } },
   { docId: 'x2', title: 'X2', snapshot: { ownerId: 'a', updatedAt: 't2', activeReviewId: 'r1', freshnessSig: '30|d|1|' } }
@@ -361,6 +491,24 @@ assert(cf.length === 0, '快照一致时无冲突')
 cf = checkHandoverConflicts(snapItems, { x1: null, x2: { ownerId: 'b', updatedAt: 't2', activeReviewId: null, freshness: { cycleDays: 90, nextDueAt: 'd', round: 1, activeTicket: 'fr' } } })
 assert(cf.length === 2 && cf[0].fields.includes('文档已删除'), '删除/负责人/评审/保鲜变化均被识别')
 assert(cf[1].fields.includes('负责人已变更') && cf[1].fields.includes('评审状态已变化') && cf[1].fields.includes('保鲜配置已变化'), '冲突字段逐项标注')
+
+// 保鲜配置来源快照：新快照检出「策略关闭 → 转文档级」的来源转换；旧格式快照（无来源字段）不误判
+const srcDoc = { ownerId: 'a', updatedAt: 't', activeReviewId: null, freshness: { cycleDays: 30, nextDueAt: 'd', round: 1, activeTicket: null, source: 'doc', policyId: null } }
+cf = checkHandoverConflicts(
+  [{ docId: 'y1', title: 'Y1', snapshot: { ownerId: 'a', updatedAt: 't', activeReviewId: null, freshnessSig: '30|d|1|' } }],
+  { y1: srcDoc }
+)
+assert(cf.length === 0, '旧格式快照无来源字段 → 来源转换不误判冲突（升级兼容）')
+cf = checkHandoverConflicts(
+  [{ docId: 'y1', title: 'Y1', snapshot: { ownerId: 'a', updatedAt: 't', activeReviewId: null, freshnessSig: '30|d|1|', freshnessSource: 'policy', freshnessPolicyId: 'fp1' } }],
+  { y1: srcDoc }
+)
+assert(cf.length === 1 && cf[0].fields.includes('保鲜配置已变化'), '新快照：来源/策略转换被识别为并发变更')
+cf = checkHandoverConflicts(
+  [{ docId: 'y1', title: 'Y1', snapshot: { ownerId: 'a', updatedAt: 't', activeReviewId: null, freshnessSig: '30|d|1|', freshnessSource: 'doc', freshnessPolicyId: null } }],
+  { y1: srcDoc }
+)
+assert(cf.length === 0, '新快照：来源一致时无冲突')
 
 const mk = (...ss) => ({ items: ss.map((s) => ({ status: s })) })
 assert(handoverStatusOf(mk('pending_confirm', 'confirmed')) === HANDOVER.PENDING_CONFIRM, '有待确认篇 → 待接任者确认')

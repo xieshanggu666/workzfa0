@@ -8,6 +8,8 @@ import { isFreshTicketOpen, buildFreshTimelineEntry } from '@/utils/freshness'
 import {
   HO_ITEM, REVOKE_MODE, isItemOpen, handoverStatusOf, handoverSnapshotOf, checkHandoverConflicts
 } from '@/utils/handover'
+import { GAP } from '@/utils/gap'
+import { CORRECTION } from '@/utils/correction'
 import { isDocRetired } from '@/utils/retirement'
 import { isGateStatusOpen } from '@/utils/release'
 import { GUEST_ID, isGuestUser, ROLE } from '@/utils/permission'
@@ -20,8 +22,11 @@ import { useAuthStore } from './auth'
 // - 所有权：doc.ownerId 交给该篇接任者，原负责人任期追加进 doc.ownerHistory（历史归属全程保留）；
 // - 待办审批：文档上流转中的评审单（原负责人名下）改挂接任者，待审批的访问申请随所有权自动转移；
 // - 保鲜责任：复核周期随所有权转移，流转中的复核单留痕并改挂送审人；
-// - 权限收回：按发起时的交接决定（keep/revoke）保留或收回原负责人的协作成员身份与有效授权。
-// 批准执行时先以发起快照逐篇复核并发变更（负责人/内容/评审/保鲜配置）：校验与回退以「篇」为单位，
+// - 流转工单：绑定本文档、原负责人认领中的纠错单/缺口工单随责任改挂接任者，
+//   与评审待办同源转移——避免评审已改挂而工单仍留旧负责人（驳回/撤回会退回给已无权限的人）；
+// - 权限收回：按发起时的交接决定（keep/revoke）保留或收回原负责人的协作成员身份、有效授权，
+//   并取消其本人待审批的访问申请（留着会被后续批准复活，违背收回决定）。
+// 批准执行时先以发起快照逐篇复核并发变更（负责人/内容/评审/保鲜配置及来源）：校验与回退以「篇」为单位，
 // 冲突篇标记失败（事务内不写入该篇任何转移），不影响同批其他篇；单篇转移写入异常由 Dexie 事务
 // 整体回滚（本批不产生任何部分写入），catch 中补记失败留痕。
 export const useHandoverStore = defineStore('handover', () => {
@@ -272,7 +277,7 @@ export const useHandoverStore = defineStore('handover', () => {
     let result = { status: 'error' }
 
     try {
-      await db.transaction('rw', db.handovers, db.docs, db.reviews, db.accessRequests, db.freshnessTickets, async () => {
+      await db.transaction('rw', db.handovers, db.docs, db.reviews, db.accessRequests, db.freshnessTickets, db.gapTickets, db.correctionTickets, async () => {
         const h = await db.handovers.get(id)
         if (!h) { result = { status: 'missing' }; return }
         const wanted = new Set(docIds || [])
@@ -348,6 +353,34 @@ export const useHandoverStore = defineStore('handover', () => {
             transferredReviewIds.push(rv.id)
           }
 
+          // 流转工单（纠错/缺口）：绑定本文档且原负责人认领中的工单随责任改挂接任者。
+          // 与评审待办同源转移——评审单改挂后若工单仍留旧负责人，驳回/撤回复审会把工单
+          // 退回给（revoke 模式下）已无编辑权限的人，形成无人可处理的遗留待办
+          const transferredCorrectionIds = []
+          const openCorrections = await db.correctionTickets
+            .where('docId').equals(doc.id)
+            .filter((t) => t.claimedBy === from && (t.status === CORRECTION.CLAIMED || t.status === CORRECTION.IN_REVIEW))
+            .toArray()
+          for (const t of openCorrections) {
+            await db.correctionTickets.update(t.id, {
+              claimedBy: to,
+              timeline: [...(t.timeline || []), buildTimelineEntry('handover', userId, '负责人交接：纠错工单随文档责任转移给接任者', nowIso)]
+            })
+            transferredCorrectionIds.push(t.id)
+          }
+          const transferredGapIds = []
+          const openGapTickets = await db.gapTickets
+            .where('docId').equals(doc.id)
+            .filter((t) => t.claimedBy === from && (t.status === GAP.CLAIMED || t.status === GAP.IN_REVIEW))
+            .toArray()
+          for (const t of openGapTickets) {
+            await db.gapTickets.update(t.id, {
+              claimedBy: to,
+              timeline: [...(t.timeline || []), buildTimelineEntry('handover', userId, '负责人交接：缺口工单随文档责任转移给接任者', nowIso)]
+            })
+            transferredGapIds.push(t.id)
+          }
+
           // 保鲜责任：复核周期随所有权转移；流转中的复核单留痕并改挂送审人
           let freshTicketId = null
           const openFresh = await db.freshnessTickets
@@ -361,13 +394,10 @@ export const useHandoverStore = defineStore('handover', () => {
             freshTicketId = openFresh.id
           }
 
-          // 待办审批（访问申请）：审批责任随所有权自动转移，此处统计留痕
-          const accessPending = await db.accessRequests
-            .where('docId').equals(doc.id)
-            .filter((r) => r.status === ACCESS.PENDING).count()
-
-          // 按交接决定收回原负责人在本文档上的有效限时授权（阅读/协作）
+          // 按交接决定收回原负责人在本文档上的访问权限：有效限时授权（阅读/协作）撤销，
+          // 其本人待审批的访问申请一并取消——留着会被新负责人/管理员后续批准，已收回的权限复活
           let revokedGrants = 0
+          let cancelledRequests = 0
           if (h.revokeMode === REVOKE_MODE.REVOKE) {
             const grants = await db.accessRequests
               .where('docId').equals(doc.id)
@@ -381,13 +411,37 @@ export const useHandoverStore = defineStore('handover', () => {
               })
               revokedGrants++
             }
+            const ownPending = await db.accessRequests
+              .where('docId').equals(doc.id)
+              .filter((r) => r.applicantId === from && r.status === ACCESS.PENDING).toArray()
+            for (const r of ownPending) {
+              await db.accessRequests.update(r.id, {
+                status: ACCESS.CANCELLED,
+                timeline: [...(r.timeline || []), buildAccessTimelineEntry('cancel', userId, '负责人交接，按交接决定收回原负责人权限', nowIso)]
+              })
+              cancelledRequests++
+            }
           }
+
+          // 待办审批（访问申请）：审批责任随所有权自动转移，此处统计留痕
+          // （revoke 模式下原负责人本人的待审批申请已在上方取消，不计入转移队列）
+          const accessPending = await db.accessRequests
+            .where('docId').equals(doc.id)
+            .filter((r) => r.status === ACCESS.PENDING).count()
 
           patchItem(item.docId, {
             status: HO_ITEM.COMPLETED,
             decidedBy: userId, decidedAt: nowIso, decideNote,
             completedAt: nowIso,
-            result: { reviewIds: transferredReviewIds, freshTicketId, accessPending, revokedGrants }
+            result: {
+              reviewIds: transferredReviewIds,
+              freshTicketId,
+              accessPending,
+              revokedGrants,
+              cancelledRequests,
+              correctionTicketIds: transferredCorrectionIds,
+              gapTicketIds: transferredGapIds
+            }
           })
           timeline.push(buildTimelineEntry('approve', userId, noteOf(item.title), nowIso))
           done++
@@ -419,19 +473,23 @@ export const useHandoverStore = defineStore('handover', () => {
       result = { status: 'error' }
     }
 
-    // 联动刷新：所有权/评审待办/授权/保鲜责任均已变化
-    const [{ useReviewStore }, { useAccessStore }, { useFreshnessStore }] = await Promise.all([
-      import('./review'), import('./access'), import('./freshness')
+    // 联动刷新：所有权/评审待办/授权/保鲜责任/流转工单均已变化
+    const [{ useReviewStore }, { useAccessStore }, { useFreshnessStore }, { useGapStore }, { useCorrectionStore }] = await Promise.all([
+      import('./review'), import('./access'), import('./freshness'), import('./gap'), import('./correction')
     ])
     const review = useReviewStore()
     const access = useAccessStore()
     const freshness = useFreshnessStore()
+    const gap = useGapStore()
+    const correction = useCorrectionStore()
     await Promise.all([
       reload(),
       kb.reloadDocs(),
       review.loaded ? review.reload() : Promise.resolve(),
       access.loaded ? access.reload() : Promise.resolve(),
-      freshness.loaded ? freshness.reload() : Promise.resolve()
+      freshness.loaded ? freshness.reload() : Promise.resolve(),
+      gap.loaded ? gap.reload() : Promise.resolve(),
+      correction.loaded ? correction.reload() : Promise.resolve()
     ])
     return result
   }

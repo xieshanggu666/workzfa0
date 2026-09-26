@@ -107,6 +107,7 @@ export function gapTimelineLabel(action) {
     submit: '关联文档送审',
     resolve: '审批通过 · 回填答案来源',
     return: '退回处理',
+    handover: '负责人交接 · 工单随责任转移',
     reset: '关联文档已删除'
   }[action] || action
 }

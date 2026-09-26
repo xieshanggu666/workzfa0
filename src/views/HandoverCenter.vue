@@ -191,8 +191,11 @@ function itemResultText(item) {
   parts.push('所有权已转移')
   if (r.reviewIds?.length) parts.push('评审待办 ' + r.reviewIds.length + ' 项已改挂')
   if (r.freshTicketId) parts.push('保鲜复核单已留痕')
+  if (r.correctionTicketIds?.length) parts.push('纠错工单 ' + r.correctionTicketIds.length + ' 项已改挂')
+  if (r.gapTicketIds?.length) parts.push('缺口工单 ' + r.gapTicketIds.length + ' 项已改挂')
   if (r.accessPending) parts.push('待审批访问申请 ' + r.accessPending + ' 项随负责人转移')
   if (r.revokedGrants) parts.push('收回原负责人授权 ' + r.revokedGrants + ' 项')
+  if (r.cancelledRequests) parts.push('取消原负责人待审批申请 ' + r.cancelledRequests + ' 项')
   return parts.join(' · ')
 }
 

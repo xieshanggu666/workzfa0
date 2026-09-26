@@ -1,10 +1,11 @@
 // 知识责任交接：状态常量、派生计算、并发变更校验、权限判定与留痕工具（均为纯函数，便于复用与测试）
 // 流程：负责人在同一批交接中逐篇指定接任者（每篇文档可交接给不同成员）→ 各接任者按篇独立
 // 确认或谢绝 → 管理员按确认结果分批批准（已确认篇可先批先转，谢绝/待确认篇不参与本批）→
-// 批准篇在同一事务内执行转移：所有权（保留历史归属）、待办审批、保鲜责任一并转移，
-// 并按交接决定保留/收回原负责人权限。批准执行时以发起快照逐篇复核并发变更：
-// 校验与回退均以「篇」为单位，冲突篇标记失败（failed），不影响同批其他篇的确认与转移；
-// 单篇转移写入异常由 Dexie 事务整体回滚，不产生部分写入。
+// 批准篇在同一事务内执行转移：所有权（保留历史归属）、待办审批（评审/访问申请）、保鲜责任、
+// 原负责人名下绑定本文档的流转中工单（纠错/缺口）一并转移，并按交接决定保留/收回原负责人权限
+// （收回含撤销有效授权 + 取消其待审批申请，避免权限经后续审批复活）。批准执行时以发起快照逐篇
+// 复核并发变更：校验与回退均以「篇」为单位，冲突篇标记失败（failed），不影响同批其他篇的确认
+// 与转移；单篇转移写入异常由 Dexie 事务整体回滚，不产生部分写入。
 import { ROLE, isGuestUser } from './permission'
 
 // 交接篇（单篇文档）状态：交接流转的最小单元
@@ -140,12 +141,16 @@ export function handoverSnapshotOf(doc) {
     ownerId: doc.ownerId,
     updatedAt: doc.updatedAt,
     activeReviewId: doc.activeReviewId || null,
-    freshnessSig: freshnessSig(doc)
+    freshnessSig: freshnessSig(doc),
+    // 保鲜配置来源（继承分类策略/文档级覆盖）：关闭分类策略等治理操作只改来源、不改周期签名，
+    // 单独纳入快照才能检出；旧格式快照无这两个字段，校验时按「未跟踪」跳过（升级兼容）
+    freshnessSource: doc.freshness?.source || null,
+    freshnessPolicyId: doc.freshness?.policyId || null
   }
 }
 
 // 并发变更校验（纯函数）：以发起快照对比库中最新文档，返回不一致清单。
-// 负责人变更、内容更新、评审状态变化、保鲜配置变化、文档被删除均视为冲突；
+// 负责人变更、内容更新、评审状态变化、保鲜配置（含来源）变化、文档被删除均视为冲突；
 // 返回空数组表示这些篇可安全执行转移。
 export function checkHandoverConflicts(items, docMap) {
   const failures = []
@@ -160,7 +165,14 @@ export function checkHandoverConflicts(items, docMap) {
     if (doc.ownerId !== snap.ownerId) fields.push('负责人已变更')
     if (doc.updatedAt !== snap.updatedAt) fields.push('内容已更新')
     if ((doc.activeReviewId || null) !== (snap.activeReviewId || null)) fields.push('评审状态已变化')
-    if (freshnessSig(doc) !== snap.freshnessSig) fields.push('保鲜配置已变化')
+    if (freshnessSig(doc) !== snap.freshnessSig) {
+      fields.push('保鲜配置已变化')
+    } else if ('freshnessSource' in snap &&
+      ((doc.freshness?.source || null) !== (snap.freshnessSource || null) ||
+        (doc.freshness?.policyId || null) !== (snap.freshnessPolicyId || null))) {
+      // 周期签名一致但配置来源被转换（如分类策略关闭 → 在途复核单转文档级配置）
+      fields.push('保鲜配置已变化')
+    }
     if (fields.length) failures.push({ docId: item.docId, title: doc.title, fields })
   }
   return failures
